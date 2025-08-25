@@ -4,7 +4,7 @@
 import * as THREE from 'three';
 import { useEffect, useMemo, useRef } from 'react';
 import { useFrame } from '@react-three/fiber';
-import { Sphere, useFBX } from '@react-three/drei';
+import { useFBX } from '@react-three/drei';
 import { clone as cloneSkeleton } from 'three/examples/jsm/utils/SkeletonUtils.js';
 
 type Key =
@@ -29,20 +29,16 @@ const MOVE_KEYS: Key[] = [
 ];
 
 export function Character() {
-  // FBX model and walking animation clip
-  const original = useFBX('/models/CharSol.fbx'); // geometry/rig
-  const walkFBX = useFBX('/models/walking.fbx'); // animation-only file expected
+  const baseRig = useFBX('/models/CharSol.fbx');
+  const idleFBX = useFBX('/models/standingIdle.fbx');
+  const walkFBX = useFBX('/models/walking.fbx');
 
-  // Safe skinned clone of the original rig for animation
-  const model = useMemo(
-    () => cloneSkeleton(original) as THREE.Group,
-    [original]
-  );
-
-  // Prepare the group that will be moved/rotated
+  const model = useMemo(() => cloneSkeleton(baseRig) as THREE.Group, [baseRig]);
   const groupRef = useRef<THREE.Group>(null);
 
-  // Normalize model props
+  // If your rig's authored forward isn't +Z, adjust this (e.g. Math.PI to flip)
+  const MODEL_YAW_OFFSET = 0;
+
   useMemo(() => {
     model.traverse((o: any) => {
       if (o.isMesh) {
@@ -53,30 +49,43 @@ export function Character() {
     });
   }, [model]);
 
-  // Animation mixer + action
   const mixer = useMemo(() => new THREE.AnimationMixer(model), [model]);
+  const idleClip = useMemo(() => idleFBX.animations?.[0] ?? null, [idleFBX]);
   const walkClip = useMemo(() => walkFBX.animations?.[0] ?? null, [walkFBX]);
+
+  const idleActionRef = useRef<THREE.AnimationAction | null>(null);
   const walkActionRef = useRef<THREE.AnimationAction | null>(null);
 
   useEffect(() => {
-    if (!walkClip) {
-      return;
+    // Idle is default
+    if (idleClip) {
+      const idle = mixer.clipAction(idleClip, model);
+      idle.loop = THREE.LoopRepeat;
+      idle.clampWhenFinished = false;
+      idle.enabled = true;
+      idle.reset();
+      idle.setEffectiveWeight(1); // visible by default
+      idle.play();
+      idleActionRef.current = idle;
     }
-    const action = mixer.clipAction(walkClip, model);
-    action.loop = THREE.LoopRepeat;
-    action.clampWhenFinished = false;
-    action.enabled = true;
-    action.weight = 1; // start blended out (idle)
-    action.play();
-    walkActionRef.current = action;
+
+    // Walk is blended out initially
+    if (walkClip) {
+      const walk = mixer.clipAction(walkClip, model);
+      walk.loop = THREE.LoopRepeat;
+      walk.clampWhenFinished = false;
+      walk.enabled = true;
+      walk.reset();
+      walk.setEffectiveWeight(0); // hidden by default
+      walk.play();
+      walkActionRef.current = walk;
+    }
+
     return () => {
-      console.log('cleanup');
-      action.stop();
       mixer.stopAllAction();
     };
-  }, [mixer, model, walkClip]);
+  }, [mixer, model, idleClip, walkClip]);
 
-  // Key state
   const keysRef = useRef<Record<Key, boolean>>({
     KeyW: false,
     KeyA: false,
@@ -105,13 +114,11 @@ export function Character() {
     };
   }, []);
 
-  // Movement + rotation + animation blending
-  const SPEED = 3.0; // units/sec
-  const TURN_SMOOTH = 10.0; // higher = snappier turn
+  const SPEED = 3.0;
+  const TURN_SMOOTH = 10.0;
   const tmpDir = new THREE.Vector3();
   const targetQuat = new THREE.Quaternion();
   const yUp = new THREE.Vector3(0, 1, 0);
-
   const lastMovingRef = useRef(false);
 
   useFrame((_, delta) => {
@@ -122,68 +129,48 @@ export function Character() {
     const left = keysRef.current.KeyA || keysRef.current.ArrowLeft ? 1 : 0;
     const right = keysRef.current.KeyD || keysRef.current.ArrowRight ? 1 : 0;
 
-    // Build desired move direction in world space (+X right, +Z forward)
-    tmpDir.set(right - left, 0, back - forward); // note: -Z is "forward" in Three's default view
+    // +Z minus forward gives -Z when W is held (typical "forward" in Three scenes)
+    tmpDir.set(right - left, 0, back - forward);
     const isMoving = tmpDir.lengthSq() > 0;
 
-    // Blend animation based on movement
+    // Animation state machine: idle <-> walk
+    const idle = idleActionRef.current;
     const walk = walkActionRef.current;
-    if (walk) {
+
+    if (idle && walk) {
       if (isMoving && !lastMovingRef.current) {
-        walk.enabled = true;
-        walk.fadeIn(0.15);
+        // go idle -> walk
+        idle.crossFadeTo(walk, 0.15, false);
+        walk.setEffectiveWeight(1);
+        idle.setEffectiveWeight(0);
       } else if (!isMoving && lastMovingRef.current) {
-        walk.fadeOut(0.2);
+        // go walk -> idle
+        walk.crossFadeTo(idle, 0.2, false);
+        idle.setEffectiveWeight(1);
+        walk.setEffectiveWeight(0);
       }
     }
     lastMovingRef.current = isMoving;
 
-    // Rotate toward movement direction and translate
+    // Rotation + translation
     const g = groupRef.current;
     if (!g) return;
 
     if (isMoving) {
       tmpDir.normalize();
-
-      // Compute yaw from desired direction (face the movement vector)
-      // Our tmpDir uses +Z forward; if you prefer -Z forward, negate Z in dir or flip here.
-      const yaw = Math.atan2(tmpDir.x, tmpDir.z); // radians
-
+      const yaw = Math.atan2(tmpDir.x, tmpDir.z) + MODEL_YAW_OFFSET;
       targetQuat.setFromAxisAngle(yUp, yaw);
       g.quaternion.slerp(targetQuat, Math.min(1, TURN_SMOOTH * delta));
-
-      // Move in facing direction
-      // Use the same normalized tmpDir for translation
       g.position.addScaledVector(tmpDir, SPEED * delta);
-    }
-  });
-  console.log(groupRef.current);
-  const spherePosition = new THREE.Vector3(0, 20, 5);
-  const pointLightRef = useRef<THREE.PointLight>(null);
-
-  useFrame(() => {
-    if (pointLightRef.current) {
-      const time = Date.now() * 0.002;
-      spherePosition.y = 30 + Math.sin(time) * 20;
-      pointLightRef.current.position.set(
-        spherePosition.x,
-        spherePosition.y,
-        spherePosition.z
-      );
+      if (walk) walk.timeScale = 1;
+    } else {
+      if (idle) idle.timeScale = 1;
     }
   });
 
   return (
     <group ref={groupRef}>
-      {/* Render the animated rig */}
       <primitive object={model} scale={0.1} />
-
-      <pointLight
-        ref={pointLightRef}
-        position={spherePosition}
-        intensity={200.8}
-        color={0xffff00}
-      />
     </group>
   );
 }
